@@ -5,10 +5,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import api_settings
 from api.db.repositories import (
-    CacheRepository, ModelVersionRepository, VerdictRepository,
+    CacheRepository,
+    GuildWhitelistRepository,
+    ModelVersionRepository,
+    VerdictRepository,
 )
 from api.ml.base import TextClassifier
 from api.services.hashing import hash_image, hash_text
+
+
+def _content_matches_whitelist(content: str, phrases: list[str]) -> bool:
+    """Подстрочная проверка без регистра."""
+    if not phrases:
+        return False
+    haystack = content.lower()
+    return any(phrase.lower() in haystack for phrase in phrases)
 
 
 class ModerationService:
@@ -18,6 +29,7 @@ class ModerationService:
         self._verdicts = VerdictRepository(session)
         self._cache = CacheRepository(session)
         self._versions = ModelVersionRepository(session)
+        self._whitelist = GuildWhitelistRepository(session)
 
     def _classify_score(self, score: float) -> tuple[str, str]:
         if score < api_settings.threshold_uncertain:
@@ -39,7 +51,28 @@ class ModerationService:
         if existing:
             return self._verdict_to_dict(existing, cache_hit=False, repeat=True)
 
-        # 2. Кеш по хешу контента
+        # 2. Белый список гильдии — обходит кеш и инференс целиком.
+        #    Контент НЕ кешируется, чтобы добавление/удаление слова из списка
+        #    сразу влияло на дальнейшие сообщения с тем же текстом.
+        whitelist = await self._whitelist.get_phrases(guild_id)
+        if _content_matches_whitelist(content, whitelist):
+            model_version = await self._versions.get_or_create(
+                name=self._classifier.model_version,
+                base_model=self._classifier.model_version,
+            )
+            verdict = await self._verdicts.create(
+                message_id=message_id, guild_id=guild_id,
+                channel_id=channel_id, author_id=author_id,
+                source_kind="text",
+                content_hash=content_hash, content=content,
+                score=0.0, label="neutral", action="allow",
+                categories={"whitelist": 1.0},
+                model_version_id=model_version.id,
+                cache_hit=False, inference_ms=0,
+            )
+            return self._verdict_to_dict(verdict, cache_hit=False)
+
+        # 3. Кеш по хешу контента
         cached = await self._cache.get(content_hash, "text")
         model_version = await self._versions.get_or_create(
             name=self._classifier.model_version,
@@ -93,6 +126,7 @@ class ModerationService:
         self, verdict, *, cache_hit: bool, repeat: bool = False,
     ) -> dict:
         return {
+            "verdict_id": verdict.id,
             "message_id": verdict.message_id,
             "score": verdict.score,
             "label": verdict.label,

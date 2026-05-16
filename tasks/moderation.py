@@ -97,7 +97,14 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
     retry_backoff=True,
     retry_kwargs={"max_retries": 2},
 )
-def classify_image(self: ImageTask, image_bytes_b64: str, message_id: str) -> dict[str, Any]:
+def classify_image(
+    self: ImageTask,
+    image_bytes_b64: str,
+    message_id: str,
+    guild_id: str,
+    channel_id: str,
+    author_id: str,
+) -> dict[str, Any]:
     import base64
 
     image_bytes = base64.b64decode(image_bytes_b64)
@@ -184,6 +191,31 @@ def classify_image(self: ImageTask, image_bytes_b64: str, message_id: str) -> di
             "skipped_reason": "log_text_filtered",
         }
 
+    # Белый список по распознанному тексту — обходит инференс и блокировку.
+    whitelist_matched = asyncio.run(_check_image_whitelist(guild_id, normalized))
+    if whitelist_matched:
+        verdict_id = asyncio.run(_persist_image_verdict(
+            message_id=message_id, guild_id=guild_id,
+            channel_id=channel_id, author_id=author_id,
+            image_bytes=image_bytes, extracted_text=normalized,
+            score=0.0, label="neutral", action="allow",
+            categories={"whitelist": 1.0},
+            model_version_name="whitelist",
+            ocr_confidence=ocr_result.confidence,
+            ocr_engine=self.ocr.engine_version,
+        ))
+        return {
+            "verdict_id": verdict_id,
+            "message_id": message_id,
+            "score": 0.0,
+            "categories": {"whitelist": 1.0},
+            "model_version": "whitelist",
+            "extracted_text": normalized,
+            "ocr_confidence": ocr_result.confidence,
+            "ocr_engine": self.ocr.engine_version,
+            "skipped_reason": "whitelisted",
+        }
+
     tiny_result = asyncio.run(self.classifier.classify(normalized))
     snlp_result = asyncio.run(self.ocr_classifier.classify(normalized))
     score = max(tiny_result.score, snlp_result.score)
@@ -198,7 +230,29 @@ def classify_image(self: ImageTask, image_bytes_b64: str, message_id: str) -> di
         fs=score,
     )
 
+    # Метку и action на этом этапе ещё не знаем (роутер выбирает классификацию),
+    # но Verdict хранит уже типизированные значения. Применяем ту же логику,
+    # что и роутер для согласованности (classify_score_ocr).
+    if score < api_settings.threshold_uncertain:
+        label, action = "neutral", "allow"
+    elif score < api_settings.threshold_toxic_ocr:
+        label, action = "uncertain", "flag"
+    else:
+        label, action = "toxic", "block"
+
+    verdict_id = asyncio.run(_persist_image_verdict(
+        message_id=message_id, guild_id=guild_id,
+        channel_id=channel_id, author_id=author_id,
+        image_bytes=image_bytes, extracted_text=normalized,
+        score=score, label=label, action=action,
+        categories=categories,
+        model_version_name=tiny_result.model_version,
+        ocr_confidence=ocr_result.confidence,
+        ocr_engine=self.ocr.engine_version,
+    ))
+
     result: dict[str, Any] = {
+        "verdict_id": verdict_id,
         "message_id": message_id,
         "score": score,
         "categories": categories,
@@ -211,3 +265,76 @@ def classify_image(self: ImageTask, image_bytes_b64: str, message_id: str) -> di
     if used_low_confidence_fallback:
         result["ocr_low_confidence_fallback"] = True
     return result
+
+
+async def _check_image_whitelist(guild_id: str, normalized_text: str) -> bool:
+    """Проверка белого списка по OCR-тексту изображения."""
+    from api.db.engine import async_session_factory
+    from api.db.repositories import GuildWhitelistRepository
+    from api.services.moderation_service import _content_matches_whitelist
+
+    async with async_session_factory() as session:
+        repo = GuildWhitelistRepository(session)
+        phrases = await repo.get_phrases(guild_id)
+    return _content_matches_whitelist(normalized_text, phrases)
+
+
+async def _persist_image_verdict(
+    *,
+    message_id: str,
+    guild_id: str,
+    channel_id: str,
+    author_id: str,
+    image_bytes: bytes,
+    extracted_text: str,
+    score: float,
+    label: str,
+    action: str,
+    categories: dict,
+    model_version_name: str,
+    ocr_confidence: float,
+    ocr_engine: str,
+) -> int | None:
+    """Пишет Verdict в БД. Идемпотентно по (message_id, source_kind, content_hash).
+
+    Возвращает verdict_id или None при ошибке (логируется, не прокидывается).
+    """
+    from api.db.engine import async_session_factory
+    from api.db.repositories import ModelVersionRepository, VerdictRepository
+    from api.services.hashing import hash_image
+
+    content_hash = hash_image(image_bytes)
+    async with async_session_factory() as session:
+        try:
+            verdicts = VerdictRepository(session)
+            existing = await verdicts.find_recent_for_message(
+                message_id, "image", content_hash,
+            )
+            if existing:
+                return existing.id
+
+            versions = ModelVersionRepository(session)
+            mv = await versions.get_or_create(
+                name=model_version_name, base_model=model_version_name,
+            )
+            verdict = await verdicts.create(
+                message_id=message_id, guild_id=guild_id,
+                channel_id=channel_id, author_id=author_id,
+                source_kind="image",
+                content_hash=content_hash, content=extracted_text,
+                score=score, label=label, action=action,
+                categories=categories,
+                model_version_id=mv.id,
+                cache_hit=False, inference_ms=0,
+                ocr_confidence=ocr_confidence,
+                ocr_engine=ocr_engine,
+            )
+            await session.commit()
+            return verdict.id
+        except Exception:
+            logger.exception(
+                "failed to persist image verdict | message_id={mid}",
+                mid=message_id,
+            )
+            await session.rollback()
+            return None

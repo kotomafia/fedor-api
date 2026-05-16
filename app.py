@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from loguru import logger
 
-from api.routers import moderation, stats
+from api.routers import guilds, moderation, review, stats
 
 
 @asynccontextmanager
@@ -22,6 +22,8 @@ def create_app() -> FastAPI:
     )
     app.include_router(moderation.router)
     app.include_router(stats.router)
+    app.include_router(guilds.router)
+    app.include_router(review.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

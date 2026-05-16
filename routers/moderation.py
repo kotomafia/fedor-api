@@ -52,7 +52,13 @@ async def submit_text_moderation(payload: TextModerationRequest) -> TaskSubmitte
     status_code=202,
 )
 async def submit_image_moderation(payload: ImageModerationRequest) -> TaskSubmittedResponse:
-    task = classify_image.delay(payload.image_b64, payload.message_id)
+    task = classify_image.delay(
+        payload.image_b64,
+        payload.message_id,
+        payload.guild_id,
+        payload.channel_id,
+        payload.author_id,
+    )
     logger.info(
         "image task submitted | task_id={tid} | author={a} | source={src}",
         tid=task.id, a=payload.author_id, src=payload.source_hint,
@@ -80,6 +86,7 @@ async def get_moderation_result(task_id: str) -> TaskResultResponse:
     label, action = classify_fn(score)
 
     moderation = ModerationResponse(
+        verdict_id=raw.get("verdict_id"),
         message_id=raw["message_id"],
         score=score,
         label=label,

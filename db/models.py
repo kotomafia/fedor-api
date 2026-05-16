@@ -25,6 +25,13 @@ class ReviewStatus(StrEnum):
     SKIPPED = "skipped"     # модератор пропустил, не разметил
 
 
+class LogLevel(StrEnum):
+    OFF = "off"                 # ничего не логировать в Discord log-channel
+    BLOCK = "block"             # только блокировки
+    BLOCK_FLAG = "block_flag"   # блокировки + спорные (рекомендуемый дефолт)
+    ALL = "all"                 # включая allow
+
+
 class ModelVersion(Base):
     __tablename__ = "model_versions"
 
@@ -130,10 +137,78 @@ class ReviewQueue(Base):
     reviewer_decision_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
-    # Для будущей разметки: модератор может скорректировать score или label
+    # Скорректированная метка модератором (neutral / uncertain / toxic)
     corrected_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Числовое целевое значение для дообучения. Заполняется автоматически
+    # по corrected_label: neutral -> 0.0, toxic -> 1.0, uncertain -> 0.5.
+    # Модератор не вводит число руками.
+    corrected_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+
+
+class GuildSettings(Base):
+    __tablename__ = "guild_settings"
+
+    guild_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    review_channel_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    log_channel_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    log_level: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=LogLevel.BLOCK_FLAG.value,
+        server_default=LogLevel.BLOCK_FLAG.value,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+        onupdate=func.now(), nullable=False,
+    )
+
+
+class GuildWhitelist(Base):
+    __tablename__ = "guild_whitelist"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    phrase: Mapped[str] = mapped_column(Text, nullable=False)
+    added_by: Mapped[str] = mapped_column(String(32), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("guild_id", "phrase", name="uq_guild_whitelist_phrase"),
+    )
+
+
+class GuildIgnoredChannel(Base):
+    __tablename__ = "guild_ignored_channels"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    added_by: Mapped[str] = mapped_column(String(32), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("guild_id", "channel_id", name="uq_guild_ignored_channel"),
+    )
+
+
+class GuildIgnoredRole(Base):
+    __tablename__ = "guild_ignored_roles"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    role_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    added_by: Mapped[str] = mapped_column(String(32), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("guild_id", "role_id", name="uq_guild_ignored_role"),
     )
